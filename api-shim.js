@@ -1,7 +1,7 @@
 'use strict';
-// DeepSeek 网页版 → OpenAI 兼容 API 适配层（纯新增·独立进程·不改动守护进程与客户端的任何现有逻辑）
+// DeepSeek 网页版 → OpenAI / Anthropic 兼容 API 适配层（纯新增·独立进程·不改动守护进程与客户端的任何现有逻辑）
 //
-// 作用：对外暴露一套「像官方 API」的 HTTP 端点（/v1/chat/completions、/v1/models），
+// 作用：对外暴露「OpenAI 兼容」(/v1/chat/completions、/v1/models) 与「Anthropic 兼容」(/v1/messages) 两套端点，
 //       内部把请求翻译后转发给本机的 DeepSeek 网页守护进程（默认 http://127.0.0.1:39217），
 //       由守护进程驱动真实 Chrome 网页版出结果。于是任何吃 OpenAI/DeepSeek 官方 API 的库/工具
 //       只需把 baseURL 指到本进程（默认 http://127.0.0.1:39218/v1），即可免费用上网页版能力。
@@ -87,7 +87,10 @@ function apiAuthed(req) {
   if (!OWN_KEY) return true; // 未设 key → 本机自用，不校验
   const h = req.headers['authorization'] || '';
   const m = h.match(/^Bearer\s+(.+)$/i);
-  return !!(m && m[1] === OWN_KEY);
+  if (m && m[1] === OWN_KEY) return true;
+  // Anthropic 客户端（Claude Code / @anthropic-ai/sdk）用 x-api-key 头鉴权，一并接受
+  if ((req.headers['x-api-key'] || '') === OWN_KEY) return true;
+  return false;
 }
 
 // ——————————————————— OpenAI ↔ 守护进程 翻译 ———————————————————
@@ -964,6 +967,161 @@ function runExclusive(fn) {
   });
 }
 
+// ——————————————————— Anthropic Messages API 适配（/v1/messages）———————————————————
+// 目标：让「说 Anthropic 协议」的客户端（Claude Code / @anthropic-ai/sdk / CC Switch 的 Anthropic provider）
+//       把 baseURL 指到本 shim 即可用上 DeepSeek 网页版。做法是「双向翻译 + 复用同一内核」：
+//       ① 把 Anthropic 请求体翻成本 shim 内部的 OpenAI 形态 body，走与 /v1/chat/completions 完全相同的
+//          buildPayload（含 sticky / 识图 / 工具提示词注入）→ 串行闸门 → 守护进程 → parseToolCalls 内核；
+//       ② 再把结果翻回 Anthropic 的响应体 / SSE 事件序列。于是所有已打磨过的修复/粘连/识图逻辑零重写地复用。
+
+// 经串行闸门取一次完整结果（非流式 / 流式+工具 都先缓冲）。返回 {out,rawText,toolCalls,promptTokens,completionTokens} 或抛错。
+// 与 /v1/chat/completions 的缓冲分支同源（sticky 落库/安全网、工具解析口径一致），供 /v1/messages 复用。
+async function fetchBuffered(payload, sticky, ac, isGone) {
+  const out = await runExclusive(() => {
+    if (isGone()) return Promise.reject(Object.assign(new Error('客户端已断开'), { aborted: true }));
+    return daemonJSON('POST', '/chat', payload, { timeoutMs: (payload.timeoutMs || (payload.think ? 600000 : 240000)) + 30000, signal: ac.signal });
+  });
+  // sticky 落库推进「已发条数」；守护进程报 reused=false（线程丢了）→ 删绑定，让下一轮整段重发重新绑定
+  if (sticky) {
+    if (payload.newChat === false && out && out.reused === false) STICKY_MAP.delete(sticky.key);
+    else commitSticky(sticky);
+  }
+  const rawText = (out && out.text) || '';
+  const toolCalls = payload.toolsActive ? parseToolCalls(rawText) : [];
+  return { out, rawText, toolCalls, promptTokens: estTokens((payload.system || '') + '\n' + (payload.prompt || '')), completionTokens: estTokens(rawText) };
+}
+
+// Anthropic 风格错误体：{ type:'error', error:{ type, message } }
+function sendErrAnthropic(res, code, message, type) {
+  send(res, code, { type: 'error', error: { type: type || 'invalid_request_error', message: String(message || 'error') } });
+}
+// Anthropic SSE：每个事件都要「event: 类型」+「data: JSON」两行
+function aSse(res, event, data) {
+  try { res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n'); } catch { /* 客户端已断开 */ }
+}
+function anthropicMsgId() { return 'msg_' + crypto.randomBytes(16).toString('hex'); }
+
+// system 可为字符串或 [{type:'text',text}] → 拍平成纯文本
+function anthropicSystemToText(system) {
+  if (!system) return '';
+  if (typeof system === 'string') return system;
+  if (Array.isArray(system)) return system.map((b) => (b && typeof b.text === 'string') ? b.text : (typeof b === 'string' ? b : '')).filter(Boolean).join('\n\n');
+  if (typeof system === 'object' && typeof system.text === 'string') return system.text;
+  return '';
+}
+// Anthropic tools（{name,description,input_schema}）→ OpenAI（{type:'function',function:{name,description,parameters}}）
+function anthropicToolsToOpenAI(tools) {
+  return (Array.isArray(tools) ? tools : []).map((t) => {
+    if (!t || typeof t !== 'object') return null;
+    return { type: 'function', function: { name: t.name || 'tool', description: t.description || '', parameters: t.input_schema || t.parameters || { type: 'object', properties: {} } } };
+  }).filter(Boolean);
+}
+// Anthropic tool_choice（{type:'auto'|'any'|'tool'|'none',name?}）→ OpenAI 形态（'required' / 'none' / {function:{name}} / undefined=默认）
+function anthropicToolChoiceToOpenAI(tc) {
+  if (!tc) return undefined;
+  if (typeof tc === 'string') return tc;
+  if (tc.type === 'any') return 'required';
+  if (tc.type === 'none') return 'none';
+  if (tc.type === 'tool' && tc.name) return { type: 'function', function: { name: tc.name } };
+  return undefined; // auto / 未知 → 默认
+}
+// 把 Anthropic 请求体翻成本 shim 内部的 OpenAI 形态 body（system→system 消息、tool_use→tool_calls、tool_result→role:'tool'、image 原样透传给识图管线）
+function anthropicToOpenAIBody(a, req) {
+  const messages = [];
+  const sysText = anthropicSystemToText(a && a.system);
+  if (sysText) messages.push({ role: 'system', content: sysText });
+  for (const m of (Array.isArray(a && a.messages) ? a.messages : [])) {
+    if (!m || typeof m !== 'object') continue;
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    const c = m.content;
+    if (typeof c === 'string') { if (c) messages.push({ role, content: c }); continue; }
+    if (!Array.isArray(c)) { const t = anthropicSystemToText(c); if (t) messages.push({ role, content: t }); continue; }
+    if (role === 'assistant') {
+      let text = ''; const toolCalls = [];
+      for (const b of c) {
+        if (!b || typeof b !== 'object') continue;
+        if (b.type === 'text' && typeof b.text === 'string') text += (text ? '\n' : '') + b.text;
+        else if (b.type === 'tool_use') {
+          let args; try { args = JSON.stringify(b.input == null ? {} : b.input); } catch { args = '{}'; }
+          toolCalls.push({ id: b.id || ('call_' + crypto.randomBytes(8).toString('hex')), type: 'function', function: { name: b.name || 'tool', arguments: args } });
+        }
+        // thinking / redacted_thinking 等 → 跳过（属模型内部态，不进转录）
+      }
+      const msg = { role: 'assistant', content: text || null };
+      if (toolCalls.length) msg.tool_calls = toolCalls;
+      if (msg.content || toolCalls.length) messages.push(msg);
+      continue;
+    }
+    // user 轮：tool_result 块 → 各自一条 role:'tool'（tool_call_id 回填以便 foldMessages 认出工具名）；其余 text/image → 合成一条 user 消息
+    const userParts = [];
+    for (const b of c) {
+      if (typeof b === 'string') { if (b) userParts.push({ type: 'text', text: b }); continue; }
+      if (!b || typeof b !== 'object') continue;
+      if (b.type === 'tool_result') {
+        const raw = b.content; let toolMsgContent;
+        if (typeof raw === 'string') toolMsgContent = raw;
+        else if (Array.isArray(raw)) {
+          const parts = raw.map((x) => {
+            if (typeof x === 'string') return { type: 'text', text: x };
+            if (!x || typeof x !== 'object') return null;
+            if (x.type === 'text') return { type: 'text', text: x.text || '' };
+            if (x.type === 'image') return { type: 'image', source: x.source }; // 交由 collectImages 识图上传
+            return null;
+          }).filter(Boolean);
+          toolMsgContent = parts.length ? parts : '';
+        } else toolMsgContent = '';
+        if (b.is_error) {
+          if (typeof toolMsgContent === 'string') toolMsgContent = '[tool error] ' + toolMsgContent;
+          else if (Array.isArray(toolMsgContent)) toolMsgContent.unshift({ type: 'text', text: '[tool error]' });
+          else toolMsgContent = '[tool error]';
+        }
+        messages.push({ role: 'tool', tool_call_id: b.tool_use_id || '', content: toolMsgContent });
+      } else if (b.type === 'text') { userParts.push({ type: 'text', text: b.text || '' }); }
+      else if (b.type === 'image') { userParts.push({ type: 'image', source: b.source }); }
+      // document 等其它块 → 跳过
+    }
+    if (userParts.length) {
+      if (userParts.length === 1 && userParts[0].type === 'text') messages.push({ role: 'user', content: userParts[0].text });
+      else messages.push({ role: 'user', content: userParts });
+    }
+  }
+  const body = { model: (a && a.model) || 'deepseek-chat', messages, stream: !!(a && a.stream) };
+  const tools = anthropicToolsToOpenAI(a && a.tools);
+  if (tools.length) body.tools = tools;
+  const tcv = anthropicToolChoiceToOpenAI(a && a.tool_choice);
+  if (tcv !== undefined) body.tool_choice = tcv;
+  // 扩展开关（若客户端把它们放到顶层）：与 OpenAI 侧同名，透传给 buildPayload
+  if (a && a.think != null) body.think = a.think;
+  if (a && a.search != null) body.search = a.search;
+  if (a && a.expert != null) body.expert = a.expert;
+  if (a && a.conversation_id != null) body.conversation_id = a.conversation_id;
+  if (a && a.new_chat != null) body.new_chat = a.new_chat;
+  if (a && a.timeout_ms != null) body.timeout_ms = a.timeout_ms;
+  return body;
+}
+// OpenAI tool_calls → Anthropic tool_use 内容块（input 需为对象 → 把 arguments 串 parse 回来）
+function openAIToolCallsToAnthropic(toolCalls) {
+  return (Array.isArray(toolCalls) ? toolCalls : []).map((tc) => {
+    const f = (tc && tc.function) || {};
+    let input; try { input = JSON.parse(f.arguments || '{}'); } catch { input = {}; }
+    if (input == null || typeof input !== 'object' || Array.isArray(input)) input = {};
+    return { type: 'tool_use', id: tc.id || ('toolu_' + crypto.randomBytes(12).toString('hex')), name: f.name || 'tool', input };
+  });
+}
+// 组装 Anthropic 非流式响应体（有工具调用 → stop_reason:'tool_use' 且丢弃前置铺垫；否则 end_turn）
+function anthropicMessageResponse({ id, model, text, toolCalls, inputTokens, outputTokens }) {
+  const hasCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+  const content = [];
+  if (text) content.push({ type: 'text', text: String(text) });
+  if (hasCalls) content.push(...openAIToolCallsToAnthropic(toolCalls));
+  if (!content.length) content.push({ type: 'text', text: '' });
+  return {
+    id, type: 'message', role: 'assistant', model: model || 'deepseek-chat',
+    content, stop_reason: hasCalls ? 'tool_use' : 'end_turn', stop_sequence: null,
+    usage: { input_tokens: inputTokens || 0, output_tokens: outputTokens || 0 },
+  };
+}
+
 // ——————————————————— HTTP 服务 ———————————————————
 const server = http.createServer(async (req, res) => {
   const t0 = Date.now();
@@ -976,7 +1134,7 @@ const server = http.createServer(async (req, res) => {
   if (origin) {
     if (!ALLOW_ORIGIN || (ALLOW_ORIGIN !== '*' && origin !== ALLOW_ORIGIN)) { sendErr(res, 403, '拒绝跨域请求（设置 DEEPSEEK_API_ALLOW_ORIGIN 放行）', 'forbidden'); return log(403); }
     res.setHeader('access-control-allow-origin', ALLOW_ORIGIN === '*' ? '*' : origin);
-    res.setHeader('access-control-allow-headers', 'authorization, content-type, x-ds-conversation');
+    res.setHeader('access-control-allow-headers', 'authorization, content-type, x-ds-conversation, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access');
     res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
   }
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return log(204); }
@@ -1124,6 +1282,125 @@ const server = http.createServer(async (req, res) => {
       return log(200);
     }
 
+    // ——— Anthropic Messages API：POST /v1/messages ———
+    // Claude 系客户端把 baseURL 指到本 shim 即可用 DeepSeek 网页版。请求体先翻成内部 OpenAI 形态、复用同一内核，
+    // 再把结果翻回 Anthropic 响应体 / SSE 事件序列（message_start→content_block_*→message_delta→message_stop）。
+    if (route === 'POST /v1/messages' || route === 'POST /messages') {
+      const abody = await readBody(req);
+      if (!abody || !Array.isArray(abody.messages) || !abody.messages.length) { sendErrAnthropic(res, 400, 'messages 不能为空', 'invalid_request_error'); return log(400); }
+      const model = abody.model || 'deepseek-chat';
+      const body = anthropicToOpenAIBody(abody, req);
+      const { payload, sticky } = buildPayload(body, req);
+      if (!payload.prompt && !payload.system) { sendErrAnthropic(res, 400, 'messages 内没有可用文本', 'invalid_request_error'); return log(400); }
+      const promptTokens = estTokens((payload.system || '') + '\n' + (payload.prompt || ''));
+      const toolsActive = !!payload.toolsActive;
+      const wantStream = !!abody.stream;
+
+      // 客户端断开联动中止（同 /v1/chat/completions）：断连即 abort「shim→守护进程」的在跑请求、释放串行闸门
+      const ac = new AbortController();
+      let clientGone = false;
+      res.on('close', () => {
+        if (clientGone || res.writableEnded) return;
+        clientGone = true;
+        try { ac.abort(); } catch { /* ignore */ }
+        console.log(`  client-disconnect: abort in-flight daemon request (${route})`);
+      });
+
+      // 无工具的流式：真·逐字 → Anthropic SSE。writeHead 推迟到抢到闸门时再发（排队满/超时还能回干净 429）。
+      if (wantStream && !toolsActive) {
+        const id = anthropicMsgId();
+        let headed = false;
+        let outText = '';
+        const startEvents = () => {
+          res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+          aSse(res, 'message_start', { type: 'message_start', message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: promptTokens, output_tokens: 0 } } });
+          aSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+          aSse(res, 'ping', { type: 'ping' });
+        };
+        try {
+          await runExclusive(() => new Promise((resolve) => {
+            if (clientGone) { try { res.end(); } catch { /* ignore */ } log(499); return resolve(); }
+            headed = true; startEvents();
+            daemonStream(payload, {
+              signal: ac.signal,
+              onDelta: (d) => { outText += d; aSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: d } }); },
+              onFinish: () => {
+                commitSticky(sticky);
+                aSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+                aSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: estTokens(outText) } });
+                aSse(res, 'message_stop', { type: 'message_stop' });
+                res.end(); log(200); resolve();
+              },
+              onError: (err) => {
+                if (clientGone) { try { res.end(); } catch { /* ignore */ } log(499); return resolve(); }
+                const msg = String((err && err.message) || err);
+                aSse(res, 'error', { type: 'error', error: { type: /忙|busy/i.test(msg) ? 'overloaded_error' : 'api_error', message: msg } });
+                res.end(); log(200); resolve();
+              },
+            });
+          }));
+        } catch (err) {
+          const msg = String((err && err.message) || err);
+          if (!headed) { sendErrAnthropic(res, 429, msg, 'overloaded_error'); return log(429); }
+          aSse(res, 'error', { type: 'error', error: { type: /忙|busy/i.test(msg) ? 'overloaded_error' : 'api_error', message: msg } });
+          res.end(); return log(200);
+        }
+        return; // 交给回调收尾
+      }
+
+      // 非流式，或「流式 + 工具」：先缓冲取完整结果（只有拿到完整输出才能判定是普通回答还是 tool_use）
+      let buf;
+      try {
+        buf = await fetchBuffered(payload, sticky, ac, () => clientGone);
+      } catch (err) {
+        if (clientGone || (err && err.aborted)) { try { res.end(); } catch { /* ignore */ } return log(499); }
+        const msg = String((err && err.message) || err);
+        if (/忙|busy/i.test(msg)) { sendErrAnthropic(res, 429, msg, 'overloaded_error'); return log(429); }
+        sendErrAnthropic(res, 502, msg, 'api_error'); return log(502);
+      }
+
+      const { rawText, toolCalls, completionTokens } = buf;
+      if (buf.out && buf.out.modes) console.log(`  modes: ${JSON.stringify(buf.out.modes)} (model=${model})`);
+      if (toolsActive) console.log(`  tools: ${toolCalls.length} call(s) parsed (model=${model})`);
+      const text = toolCalls.length ? '' : rawText; // 有工具调用 → 丢弃前置铺垫，保持 tool_use 这轮干净
+
+      if (!wantStream) {
+        send(res, 200, anthropicMessageResponse({ id: anthropicMsgId(), model, text, toolCalls, inputTokens: promptTokens, outputTokens: completionTokens }));
+        return log(200);
+      }
+
+      // 流式 + 工具：把缓冲结果按 Anthropic SSE 事件序列吐出（tool_use 的入参走 input_json_delta 一次性下发）
+      const id = anthropicMsgId();
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+      aSse(res, 'message_start', { type: 'message_start', message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: promptTokens, output_tokens: 0 } } });
+      let idx = 0;
+      if (text) {
+        aSse(res, 'content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } });
+        aSse(res, 'content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text } });
+        aSse(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
+        idx++;
+      }
+      for (const blk of openAIToolCallsToAnthropic(toolCalls)) {
+        aSse(res, 'content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: blk.id, name: blk.name, input: {} } });
+        let pj; try { pj = JSON.stringify(blk.input || {}); } catch { pj = '{}'; }
+        aSse(res, 'content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: pj } });
+        aSse(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
+        idx++;
+      }
+      aSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: toolCalls.length ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: { output_tokens: completionTokens } });
+      aSse(res, 'message_stop', { type: 'message_stop' });
+      res.end(); return log(200);
+    }
+
+    // ——— Anthropic 计费预估：POST /v1/messages/count_tokens ———（直接折叠取文本估算，不触发守护进程/识图/sticky）
+    if (route === 'POST /v1/messages/count_tokens' || route === 'POST /messages/count_tokens') {
+      const abody = await readBody(req);
+      const body = anthropicToOpenAIBody(abody || {}, req);
+      const { system, prompt } = foldMessages(body.messages);
+      send(res, 200, { input_tokens: estTokens((system || '') + '\n' + (prompt || '')) });
+      return log(200);
+    }
+
     sendErr(res, 404, '未知路由：' + route, 'invalid_request_error'); log(404);
   } catch (e) {
     sendErr(res, 500, String((e && e.message) || e), 'api_error'); log(500);
@@ -1142,7 +1419,7 @@ if (require.main === module) {
     console.log(`  转发到守护进程: ${DAEMON}`);
     console.log(`  鉴权: ${OWN_KEY ? '开（需 Bearer DEEPSEEK_API_KEY）' : '关（本机自用，任意 key 放行）'}`);
     console.log(`  跨域: ${ALLOW_ORIGIN ? ('允许 ' + ALLOW_ORIGIN) : '拒绝带 Origin 的请求（CSRF 防护）'}`);
-    console.log(`  端点: POST /v1/chat/completions · GET /v1/models · GET /health`);
+    console.log(`  端点: POST /v1/chat/completions · POST /v1/messages · GET /v1/models · GET /health`);
   });
 }
 
@@ -1157,4 +1434,7 @@ module.exports = {
   // sticky（会话粘连）
   buildPayload, commitSticky, foldDelta, msgSig, firstUserContent, bodyMessages, sha1hex,
   STICKY_MAP,
+  // Anthropic Messages API 适配（/v1/messages）
+  anthropicSystemToText, anthropicToolsToOpenAI, anthropicToolChoiceToOpenAI,
+  anthropicToOpenAIBody, openAIToolCallsToAnthropic, anthropicMessageResponse,
 };

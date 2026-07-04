@@ -4,12 +4,12 @@
 
 [English](README.md) · **简体中文**
 
-> 让任意「OpenAI 风格」的工具**免费**用上 **DeepSeek 网页版**（chat.deepseek.com）——无需 API Key，不按 token 计费。
+> 让任意「OpenAI 风格」**或**「Anthropic 风格」的工具**免费**用上 **DeepSeek 网页版**（chat.deepseek.com）——无需 API Key，不按 token 计费。
 
 `deepseek-web` 是一个常驻本机的小服务：用 Playwright 驱动一个**已登录**的真实 Chrome 页面（`chat.deepseek.com`），并以两种方式对外暴露：
 
 1. 一个瘦身的 **HTTP 守护进程**（`server.js`，端口 `39217`），任意语言可直接调；
-2. 一层 **OpenAI 兼容适配器**（`api-shim.js`，端口 `39218`）——把任意工具的 `baseURL` 指过来即可用上网页版能力，包括**深度思考(R1)**、**联网搜索**、**专家模式**、**识图**、**流式**、**工具/函数调用**。
+2. 一层 **OpenAI 与 Anthropic 双协议兼容适配器**（`api-shim.js`，端口 `39218`）——把任意工具的 `baseURL` 指过来即可用上网页版能力，包括**深度思考(R1)**、**联网搜索**、**专家模式**、**识图**、**流式**、**工具/函数调用**。它同时讲 OpenAI 协议（`POST /v1/chat/completions`）**和** Anthropic Messages 协议（`POST /v1/messages`），所以 **Claude Code**、**Anthropic SDK**、CC Switch 的 Anthropic 供应商也能接。
 
 反爬工作量证明由页面自身的 JS 计算，本项目**不复刻任何私有 HTTP、不碰 PoW**——只做三件事：切模式 → 填 prompt（或传图）→ 读回复。登录**一次**，全机所有项目都能通过本地 HTTP 复用；因为浏览器只有这一个持有者，**多个项目并发调用也不会有 Chrome profile 争锁问题**。
 
@@ -27,11 +27,12 @@
 ## 架构
 
 ```
-你的程序 (OpenAI SDK / LangChain / Codex / curl ...)
-     │  POST /v1/chat/completions        （OpenAI 协议）
+你的程序 (OpenAI SDK / LangChain / Codex / Claude Code / Anthropic SDK / curl ...)
+     │  POST /v1/chat/completions   （OpenAI 协议）
+     │  POST /v1/messages           （Anthropic 协议）
      ▼
-api-shim.js        :39218   ← OpenAI 兼容层，只依赖 Node 内置模块，独立进程
-     │  翻译成守护进程协议并转发
+api-shim.js        :39218   ← OpenAI & Anthropic 兼容层，只依赖 Node 内置模块，独立进程
+     │  两套协议都翻译成同一内部形态并转发给守护进程
      ▼
 server.js (守护进程) :39217   ← 驱动之上的瘦 HTTP API
      │  Playwright 驱动页面
@@ -187,13 +188,59 @@ print(llm.invoke("解释一下量子纠缠").content)
 
 支持工具的 Agent（Codex、Cline 等）可经适配层的「提示词工程」工具调用真正操作本地工具，包括多步文件编辑与桌面自动化（见下文）。
 
+### Claude Code / Anthropic 客户端（用 Anthropic Base URL）
+
+讲 **Anthropic Messages 协议**的工具——[Claude Code](https://docs.claude.com/en/docs/claude-code)、`@anthropic-ai/sdk`、或 CC Switch 的 *Anthropic* 供应商——改指到适配层的 `POST /v1/messages` 端点：
+
+| 配置项 | 值 |
+|---|---|
+| Base URL | `http://127.0.0.1:39218`（客户端自己会拼上 `/v1/messages`）|
+| API Key（以 `x-api-key` 头发送）| 任意非空字符串，除非你设了 `DEEPSEEK_API_KEY` |
+| 模型 | `deepseek-chat`（普通）或 `deepseek-reasoner`（深度思考）|
+
+**Claude Code** 从环境变量读取：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:39218
+export ANTHROPIC_API_KEY=sk-local          # 任意非空字符串（或与 DEEPSEEK_API_KEY 一致）
+export ANTHROPIC_MODEL=deepseek-chat        # 可选：适配层映射到哪个模型
+claude
+```
+
+**Anthropic Node SDK：**
+
+```js
+import Anthropic from '@anthropic-ai/sdk';
+const client = new Anthropic({ baseURL: 'http://127.0.0.1:39218', apiKey: 'sk-local' });
+const msg = await client.messages.create({
+  model: 'deepseek-chat',
+  max_tokens: 1024,
+  messages: [{ role: 'user', content: '你好，DeepSeek 网页版' }],
+});
+console.log(msg.content);
+```
+
+**curl：**
+
+```bash
+curl http://127.0.0.1:39218/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: sk-local' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"deepseek-chat","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
+```
+
+> **实话提醒。** 这只是让「讲 Anthropic 协议」的客户端**能连上**；底层模型仍是 DeepSeek 网页版，带着它固有的约束——工具调用是提示词工程实现的（可靠但非 100%）、同一时刻只能跑一个请求（并发会 `429`）、`max_tokens`/`temperature` 被忽略。重度 Agent 循环（大量快速工具调用）会比真正的 Anthropic 模型更慢、更不稳。
+
 ---
 
-## OpenAI API 参考（适配层，`:39218`）
+## API 参考（适配层，`:39218`）
 
 | 方法 & 路径 | 说明 |
 |---|---|
 | `POST /v1/chat/completions`（别名 `POST /chat/completions`）| 对话补全，兼容 OpenAI。`stream: true` 为真·逐字 SSE |
+| `POST /v1/messages`（别名 `POST /messages`）| **Anthropic Messages API。** `stream: true` 为 Anthropic SSE 事件流。复用同一内核（sticky、识图、工具调用）|
+| `POST /v1/messages/count_tokens`（别名 `POST /messages/count_tokens`）| 对 Anthropic 请求做输入 token 粗估（不触发生成）|
 | `GET /v1/models`（别名 `GET /models`）| 列出 `deepseek-chat`、`deepseek-reasoner` |
 | `GET /health` | 探活（公开，不需鉴权）|
 
@@ -241,6 +288,16 @@ print(llm.invoke("解释一下量子纠缠").content)
 - **流式 + 工具**：带 `tools` 时会**先缓冲整段再判定**（否则正文已逐字推出、末尾才发现是工具调用就来不及收回）。无工具的流式仍是真·逐字。
 - 本质是提示词驱动，绝大多数情况稳定但非 100%：极少数模型不守格式时该轮退化为普通文本（`finish_reason: "stop"`），重试即可。
 
+### Anthropic Messages API（`/v1/messages`）
+
+面向 Anthropic 协议的客户端，适配层做**双向翻译**并复用**完全相同的内核**（sticky、识图、提示词工程工具调用）：
+
+- **请求 → 内部形态**：顶层 `system`（字符串或 `[{type:"text"}]` 块）折叠进转录；`messages` 的内容块（`text` / `image` / `tool_use` / `tool_result`）逐一映射；`tools`（`{name, description, input_schema}`）与 `tool_choice`（`auto` / `any` / `tool` / `none`）转成适配层的工具调用。鉴权从 **`x-api-key`** 头读取（也接受 Bearer）。
+- **响应 → Anthropic 形态**：`{type:"message", role:"assistant", content:[{type:"text"} | {type:"tool_use", id, name, input}], stop_reason:"end_turn" | "tool_use", usage}`。流式吐标准事件序列：`message_start` → `content_block_start` → `content_block_delta`（`text_delta`，工具调用则 `input_json_delta`）→ `content_block_stop` → `message_delta` → `message_stop`。
+- **扩展字段**（`search`、`expert`、`conversation_id`、`new_chat`、`timeout_ms`）放在请求体顶层同样生效。
+- **错误体是 Anthropic 风格**：`{ "type": "error", "error": { "type", "message" } }`（忙 → `429` `overloaded_error`；守护进程连不上 / 未登录 / 失败 → `502` `api_error`）。
+- `POST /v1/messages/count_tokens` 返回 `{ "input_tokens": N }`（粗估，不触发生成）。
+
 ### 会话粘连 sticky（默认开启）
 
 某些客户端（如经 CC Switch 的 Codex）**不传** `conversation_id`。若不处理，每轮都会新开一个网页对话并重发全量历史。**sticky** 解决它：适配层用**首条 user 消息**的指纹（`key = codex:sha1(首条 user 文本).slice(0,16)`）认出「同一个对话」，映射到一条网页线程，之后只把**新增**消息增量发过去。
@@ -251,9 +308,9 @@ print(llm.invoke("解释一下量子纠缠").content)
 
 ### 错误与并发
 
-- 错误体是 **OpenAI 风格**：`{ "error": { "message", "type", "param", "code" } }`。
-- 忙（并发争用）→ HTTP `429` + `type: rate_limit_error`。
-- 守护进程连不上 / 未登录 / 生成失败 → `502` + `type: api_error`。
+- OpenAI 端点的错误体是 **OpenAI 风格**：`{ "error": { "message", "type", "param", "code" } }`（`/v1/messages` 端点改回 **Anthropic 风格**错误——见上）。
+- 忙（并发争用）→ HTTP `429`（OpenAI 为 `rate_limit_error`，Anthropic 为 `overloaded_error`）。
+- 守护进程连不上 / 未登录 / 生成失败 → `502` + `api_error`。
 
 ---
 
@@ -382,7 +439,7 @@ await ds.chat({ prompt: '这张图讲了什么？', images: ['/tmp/chart.png'] }
 ```
 deepseek-web/
 ├── server.js            # 守护进程：驱动之上的 HTTP API（:39217）
-├── api-shim.js          # OpenAI 兼容 API 层（:39218）
+├── api-shim.js          # OpenAI & Anthropic 兼容 API 层（:39218）
 ├── deepseek-driver.js   # Playwright 驱动（模式 / prompt / 识图 / 读回复）
 ├── client.js            # 零依赖 Node 瘦客户端
 ├── cli-login.js         # `npm run login` 助手

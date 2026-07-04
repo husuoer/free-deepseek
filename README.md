@@ -4,12 +4,12 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-> Use **DeepSeek web** (chat.deepseek.com) for free from any OpenAI-compatible tool — no API key, no per-token billing.
+> Use **DeepSeek web** (chat.deepseek.com) for free from any OpenAI- or Anthropic-compatible tool — no API key, no per-token billing.
 
 `deepseek-web` is a small **local** service that drives one **already-logged-in** real Chrome page of `chat.deepseek.com` via Playwright, and exposes it two ways:
 
 1. A tiny **HTTP daemon** (`server.js`, port `39217`) that any language can call.
-2. An **OpenAI-compatible API shim** (`api-shim.js`, port `39218`) — point any tool's `baseURL` at it and you get DeepSeek web, including **deep-thinking (R1)**, **web-search**, **expert mode**, **vision**, **streaming**, and **tool/function calling**.
+2. An **OpenAI- *and* Anthropic-compatible API shim** (`api-shim.js`, port `39218`) — point any tool's `baseURL` at it and you get DeepSeek web, including **deep-thinking (R1)**, **web-search**, **expert mode**, **vision**, **streaming**, and **tool/function calling**. It speaks both the OpenAI protocol (`POST /v1/chat/completions`) **and** the Anthropic Messages protocol (`POST /v1/messages`), so tools like **Claude Code**, the **Anthropic SDK**, and CC Switch's Anthropic provider work too.
 
 Because the page's own JavaScript computes the anti-bot proof-of-work, this project never reimplements any private HTTP or PoW — it only switches modes, types the prompt (or uploads images), and reads the reply back. Log in **once**; every project on the machine reuses that session over local HTTP, and since there is a single browser holder there is **no Chrome-profile lock contention**.
 
@@ -27,11 +27,12 @@ Because the page's own JavaScript computes the anti-bot proof-of-work, this proj
 ## Architecture
 
 ```
-Your app  (OpenAI SDK / LangChain / Codex / curl ...)
-     │  POST /v1/chat/completions        (OpenAI protocol)
+Your app  (OpenAI SDK / LangChain / Codex / Claude Code / Anthropic SDK / curl ...)
+     │  POST /v1/chat/completions   (OpenAI protocol)
+     │  POST /v1/messages           (Anthropic protocol)
      ▼
-api-shim.js        :39218   ← OpenAI-compatible layer, Node built-ins only, standalone process
-     │  translated + forwarded to the daemon protocol
+api-shim.js        :39218   ← OpenAI- & Anthropic-compatible layer, Node built-ins only, standalone process
+     │  both protocols translated to one internal form + forwarded to the daemon
      ▼
 server.js (daemon) :39217   ← thin HTTP API over the driver
      │  Playwright drives the page
@@ -187,13 +188,59 @@ Point the tool at the shim as if it were the OpenAI/DeepSeek API:
 
 Agents that support tools (Codex, Cline, etc.) work through the shim's prompt-engineered tool-calling (see below), including multi-step file edits and desktop automation.
 
+### Claude Code / Anthropic clients (Anthropic base URL)
+
+Tools that speak the **Anthropic Messages protocol** — [Claude Code](https://docs.claude.com/en/docs/claude-code), the `@anthropic-ai/sdk`, or CC Switch's *Anthropic* provider — point at the shim's `POST /v1/messages` endpoint instead:
+
+| Setting | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:39218` (the client appends `/v1/messages` itself) |
+| API Key (sent as `x-api-key`) | any non-empty string unless you set `DEEPSEEK_API_KEY` |
+| Model | `deepseek-chat` (normal) or `deepseek-reasoner` (deep-thinking) |
+
+**Claude Code** reads these from the environment:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:39218
+export ANTHROPIC_API_KEY=sk-local          # any non-empty string (or match DEEPSEEK_API_KEY)
+export ANTHROPIC_MODEL=deepseek-chat        # optional: which model the shim maps
+claude
+```
+
+**Anthropic Node SDK:**
+
+```js
+import Anthropic from '@anthropic-ai/sdk';
+const client = new Anthropic({ baseURL: 'http://127.0.0.1:39218', apiKey: 'sk-local' });
+const msg = await client.messages.create({
+  model: 'deepseek-chat',
+  max_tokens: 1024,
+  messages: [{ role: 'user', content: 'Hello from DeepSeek web' }],
+});
+console.log(msg.content);
+```
+
+**curl:**
+
+```bash
+curl http://127.0.0.1:39218/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: sk-local' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"deepseek-chat","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+> **Honest caveat.** This lets Anthropic-protocol clients *connect*; the model underneath is still DeepSeek web with its constraints — tool-calling is prompt-engineered (reliable but not 100%), only one request runs at a time (concurrent calls get `429`), and `max_tokens`/`temperature` are ignored. Heavy agentic loops with many rapid tool calls will be slower and less robust than a real Anthropic model.
+
 ---
 
-## OpenAI API reference (shim, `:39218`)
+## API reference (shim, `:39218`)
 
 | Method & path | Description |
 |---|---|
 | `POST /v1/chat/completions` (alias `POST /chat/completions`) | Chat completion, OpenAI-compatible. `stream: true` gives true token-by-token SSE. |
+| `POST /v1/messages` (alias `POST /messages`) | **Anthropic Messages API.** `stream: true` gives Anthropic SSE events. Reuses the same core (sticky, vision, tool-calling). |
+| `POST /v1/messages/count_tokens` (alias `POST /messages/count_tokens`) | Rough input-token estimate for an Anthropic request (no generation). |
 | `GET /v1/models` (alias `GET /models`) | Lists `deepseek-chat` and `deepseek-reasoner`. |
 | `GET /health` | Liveness (public, no auth). |
 
@@ -241,6 +288,16 @@ The web UI has **no native tool-calling channel**, so the shim adds it via promp
 - **Streaming + tools**: when `tools` are present, the shim buffers the whole reply before deciding (so it never leaks partial prose that turns out to be a tool call). Tool-free streaming stays truly token-by-token.
 - It is prompt-driven, so it is highly reliable but not 100%: if a model ignores the format, that turn degrades to a plain text answer (`finish_reason: "stop"`) — just retry.
 
+### Anthropic Messages API (`/v1/messages`)
+
+For Anthropic-protocol clients the shim translates both directions and reuses the **exact same core** (sticky, vision, prompt-engineered tools):
+
+- **Request → internal form:** top-level `system` (string or `[{type:"text"}]` blocks) folds into the transcript; `messages` content blocks (`text` / `image` / `tool_use` / `tool_result`) are mapped; `tools` (`{name, description, input_schema}`) and `tool_choice` (`auto` / `any` / `tool` / `none`) convert to the shim's tool-calling. Auth is read from the **`x-api-key`** header (Bearer also accepted).
+- **Response → Anthropic form:** `{type:"message", role:"assistant", content:[{type:"text"} | {type:"tool_use", id, name, input}], stop_reason:"end_turn" | "tool_use", usage}`. Streaming emits the standard event sequence: `message_start` → `content_block_start` → `content_block_delta` (`text_delta`, or `input_json_delta` for a tool call) → `content_block_stop` → `message_delta` → `message_stop`.
+- **Extension fields** (`search`, `expert`, `conversation_id`, `new_chat`, `timeout_ms`) work here too when placed at the top level of the request body.
+- **Errors are Anthropic-style:** `{ "type": "error", "error": { "type", "message" } }` (busy → `429` `overloaded_error`; daemon down / not logged in / failed → `502` `api_error`).
+- `POST /v1/messages/count_tokens` returns `{ "input_tokens": N }` (rough estimate, no generation).
+
 ### Sticky conversations (default on)
 
 Some clients (e.g. Codex via CC Switch) **don't** send a `conversation_id`. Without help, each turn would open a brand-new web chat and resend the whole history. **Sticky** fixes this: the shim fingerprints the **first user message** (`key = codex:sha1(first user text).slice(0,16)`) to recognize "the same conversation", maps it to one web thread, and thereafter sends only the **new** messages incrementally.
@@ -251,9 +308,9 @@ Some clients (e.g. Codex via CC Switch) **don't** send a `conversation_id`. With
 
 ### Errors & concurrency
 
-- Error bodies are **OpenAI-style**: `{ "error": { "message", "type", "param", "code" } }`.
-- Busy (concurrent contention) → HTTP `429` + `type: rate_limit_error`.
-- Daemon unreachable / not logged in / generation failed → `502` + `type: api_error`.
+- OpenAI-endpoint error bodies are **OpenAI-style**: `{ "error": { "message", "type", "param", "code" } }` (the `/v1/messages` endpoint returns **Anthropic-style** errors instead — see above).
+- Busy (concurrent contention) → HTTP `429` (`rate_limit_error` on OpenAI, `overloaded_error` on Anthropic).
+- Daemon unreachable / not logged in / generation failed → `502` + `api_error`.
 
 ---
 
@@ -382,7 +439,7 @@ await ds.chat({ prompt: 'What is in this image?', images: ['/tmp/chart.png'] });
 ```
 deepseek-web/
 ├── server.js            # daemon: HTTP API over the driver (:39217)
-├── api-shim.js          # OpenAI-compatible API layer (:39218)
+├── api-shim.js          # OpenAI- & Anthropic-compatible API layer (:39218)
 ├── deepseek-driver.js   # Playwright driver (modes / prompt / vision / read)
 ├── client.js            # zero-dependency Node thin client
 ├── cli-login.js         # `npm run login` helper
