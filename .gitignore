@@ -1,0 +1,12 @@
+node_modules/
+profile/
+conversations.json
+*.log
+.DS_Store
+.img-tmp/
+# 本地调试 / 自测脚本（含本机私有路径与运行态，不发布）
+.dbg*.js
+.tmp-*.js
+.selftest-*.js
+.shim-debug.log
+.driver-debug.log

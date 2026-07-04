@@ -1,0 +1,34 @@
+{
+  "name": "deepseek-web",
+  "version": "1.0.0",
+  "description": "Local daemon that drives a logged-in chat.deepseek.com Chrome page via Playwright, plus an OpenAI-compatible API shim — call DeepSeek web (deep-thinking / web-search / expert / vision) for free from any OpenAI-style tool, with no API key and no per-token billing.",
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "openai-compatible",
+    "playwright",
+    "llm",
+    "chatbot",
+    "api-shim",
+    "codex",
+    "free"
+  ],
+  "//": "守护进程用 `npm start`(=node server.js) 启动；被别的项目当库引用时 require('deepseek-web') 拿到的是瘦客户端 client.js（见 exports/main）。二者互不影响。",
+  "main": "client.js",
+  "exports": {
+    ".": "./client.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "login": "node cli-login.js",
+    "api": "node api-shim.js"
+  },
+  "dependencies": {
+    "playwright": "^1.61.1"
+  }
+}
